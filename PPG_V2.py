@@ -5,7 +5,6 @@ import torch
 from torch import nn
 from torch.distributions.normal import Normal
 import torch.nn.functional as F
-import random
 from collections import deque
 from tqdm.std import tqdm
 import copy
@@ -45,36 +44,69 @@ def run_episode(env, policy, render=False):
 
 # %%
 
-
-class PPG():
+class Policy(nn.Module):
     def __init__(self, n_state, n_action):
-        # Define network
-        self.policy_net = nn.Sequential(
+        super(Policy, self).__init__()
+        self.hidden = 256
+
+        self.fc = nn.Sequential(
             nn.Linear(n_state, 128),
             nn.ReLU(),
             nn.Linear(128, 128),
-            nn.Tanh(),
+            nn.ReLU(),
         )
-        self.p = nn.Linear(128, 2*n_action)
+
+        self.theta_mu_head = nn.Linear(128, 2*n_action)
         self.v_aux_head = nn.Linear(128, 1)
 
-        self.policy_net.to(device)
-        self.old_act_net = copy.deepcopy(self.policy_net)
-        self.old_act_net.to(device)
-        self.v_net = nn.Sequential(
+    def forward(self, state):
+        out = self.fc(state)
+        theta_mu = self.theta_mu_head(out)
+        v_aux = self.v_aux_head(out)
+
+        return theta_mu, v_aux
+
+
+class Value(nn.Module):
+    def __init__(self, n_state, n_action):
+        super(Value, self).__init__()
+        self.hidden = 256
+
+        self.fc = nn.Sequential(
             nn.Linear(n_state, 128),
             nn.ReLU(),
             nn.Linear(128, 128),
             nn.ReLU(),
             nn.Linear(128, 1),
         )
+        #self.v = nn.Linear(128, 1)
 
+    def forward(self, state):
+        v_out = self.fc(state)
+        #out = self.v(out)
+        return v_out
+
+
+
+
+class PPG():
+    def __init__(self, n_state, n_action):
+        # Define network
+        self.policy_net = Policy(n_state,n_action) #object of Policy_network
+        self.policy_net.to(device)
+        self.old_policy_net = copy.deepcopy(self.policy_net)
+        self.old_policy_net.to(device)
+
+
+        self.v_net = Value(n_state,n_action)        #object of Value_network
         self.v_net.to(device)
-        self.v_optimizer = torch.optim.Adam(self.v_net.parameters(), lr=1e-3)
-        self.policy_optimizer = torch.optim.Adam(
-            self.policy_net.parameters(), lr=1e-4)
         self.old_v_net = copy.deepcopy(self.v_net)
         self.old_v_net.to(device)
+
+        self.v_optimizer = torch.optim.Adam(self.v_net.parameters(), lr=1e-3)
+        self.policy_optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=1e-4)
+        
+
         self.gamma = 0.95
         self.gae_lambda = 0.85
         self._eps_clip = 0.2
@@ -85,18 +117,11 @@ class PPG():
         self.E_aux = 1 #numer of iteration of Auxiliary Phase
         self.buff = Buffer()
 
-    def forward_2(self,x):
-        out = self.policy_net(x)
-        mu_theta = self.p(out)
-        v_aux = self.v_aux_head(out)
-        return [mu_theta, v_aux]
-
-
     def __call__(self, state):
         with torch.no_grad():
             state = torch.FloatTensor(state).to(device)
             # calculate old logprob
-            output = self.forward_2(state)[1]
+            output,_ = self.policy_net(state)
             mu = self.act_lim*torch.tanh(output[:n_action])
             var = torch.abs(output[n_action:])
             dist = Normal(mu, var)
@@ -104,7 +129,39 @@ class PPG():
             action = action.detach().cpu().numpy()
         return np.clip(action, -self.act_lim, self.act_lim)
 
-    def Policy_update(self, data=None):
+    def update_aux(self, data=None):
+        obs, act, reward, next_obs, done = data
+        obs = torch.FloatTensor(obs).to(device)
+        _, V_targ, old_log_prob = self.buff.data() #obs = obs
+        # Calculate culmulative return
+        
+        next_obs = torch.FloatTensor(next_obs).to(device)
+        act = torch.FloatTensor(act).to(device)
+        V_targ = torch.FloatTensor(V_targ[0]).to(device)
+        old_log_prob = torch.FloatTensor(old_log_prob[0]).to(device)
+        for _ in range(self.E_aux):
+            output,v_aux = self.policy_net(obs)  #extract theta and mu, v_aux from the network
+            mu = self.act_lim*torch.tanh(output[:, :n_action])
+            var = torch.abs(output[:, n_action:])
+            dist = Normal(mu, var)
+            new_log_prob = dist.log_prob(act)  #???
+        
+            aux_loss =  F.mse_loss(v_aux, V_targ)
+            new_log_prob = dist.log_prob(act).squeeze()
+            loss_kl = F.kl_div(new_log_prob,old_log_prob)
+            policy_loss = aux_loss + loss_kl
+            self.policy_optimizer.zero_grad()
+            policy_loss.backward()
+            self.policy_optimizer.step()
+
+            v_loss = F.mse_loss(self.v_net(obs).squeeze(), V_targ)
+            self.v_optimizer.zero_grad()
+            v_loss.backward()
+            self.v_optimizer.step()
+
+        return policy_loss.item(), v_loss.item()
+
+    def update(self, data=None):
         obs, act, reward, next_obs, done = data
         # Calculate culmulative return
         obs = torch.FloatTensor(obs).to(device)
@@ -113,7 +170,7 @@ class PPG():
         with torch.no_grad():
             v_s = self.old_v_net(obs).detach().cpu().numpy().squeeze()
             v_s_ = self.old_v_net(next_obs).detach().cpu().numpy().squeeze()
-            output = self.old_act_net(obs)
+            output,_ = self.old_policy_net(obs)
             mu = self.act_lim*torch.tanh(output[:, :n_action])
             var = torch.abs(output[:, n_action:])
             dist = Normal(mu, var)
@@ -139,24 +196,17 @@ class PPG():
         for i in range(len(reward) - 1, -1, -1):
             gae = delta[i] + m[i] * gae
             adv[i] = gae
-        returns = adv + v_s   #V_targ
+        returns = adv + v_s
 
         adv = torch.FloatTensor(adv).to(device)
         returns = torch.FloatTensor(returns).to(device)
         # Calculate loss
-        batch_size = 32
+        batch_size = 1
         list = [j for j in range(len(obs))]
-        
-        #Policy phase
-        for i in range(0, len(list), batch_size): #need batch?????
+        for i in range(0, len(list), batch_size):
             index = list[i:i+batch_size]
             for _ in range(self.E_Pi):
-                #output = self.policy_net(obs[index])
-                outList =  self.forward_2(obs[index])
-                output = outList[0]
-                #we do not use v_aux for the policy update phase 
-                v_aux = outList[1]
-                #output, v_aux = self.forward_2(obs[index])
+                output,_ = self.policy_net(obs[index])  #?
                 mu = self.act_lim*torch.tanh(output[:, :n_action])
                 var = torch.abs(output[:, n_action:])
                 dist = Normal(mu, var)
@@ -168,78 +218,63 @@ class PPG():
                                     self._eps_clip) * adv[index]
                 act_loss = -torch.min(surr1, surr2).mean()
 
-                ent_loss = dist.entropy().mean()        #entroy loss
-                act_loss -= self.beta_clone*ent_loss    #L_clip - beta_clone * entropy_bonus
+                ent_loss = dist.entropy().mean()            #entroy loss
+                act_loss -= self.beta_clone * ent_loss      #L_clip - beta_clone * entropy_bonus
                 self.policy_optimizer.zero_grad()
-                act_loss.backward()                     
+                act_loss.backward()
                 self.policy_optimizer.step()
 
+                self.buff.add(obs, returns, logprob) #State, V_targ, logprob, ask if that make sense?
+
             for _ in range(self.E_v):
-                v_loss = F.mse_loss(self.v_net(obs[index]).squeeze(), returns[index])
+                v_loss = F.mse_loss(self.v_net(
+                    obs[index]).squeeze(), returns[index])
                 self.v_optimizer.zero_grad()
                 v_loss.backward()
                 self.v_optimizer.step()
 
-        self.buff.add(obs, returns, logprob) #State, V_targ, logprob, ask if that make sense?
+            
         return act_loss.item(), v_loss.item(), ent_loss.item()
-
-    # Auxilary phase
-    # do we need to use a buffer
-    def Aux_update(self, data=None):
-        for _ in range(self.E_aux):
-            obs, V_targ, old_log_prob = self.buff.data() #all element in the buffer
-            aux_loss =  F.mse_loss(self.forward_2(obs)[1].squeeze(), V_targ)
-
-            output = self.forward_2(obs)[1]
-            mu = self.act_lim*torch.tanh(output[:n_action])
-            var = torch.abs(output[n_action:])
-            dist = Normal(mu, var)
-            act = dist.sample()
-            new_log_prob = dist.log_prob(act)
-            loss_kl = F.kl_div(new_log_prob,old_log_prob)
-            policy_loss = aux_loss + loss_kl
-
-            # self.v_optimizer.zero_grad()
-            # policy_loss.backward()
-            # self.v_optimizer.step()
-        
-            return
-
 
 
 class Buffer:
     def __init__(self):
-        self.buff = deque()
+        self.obs_list = []
+        self.V_targ_list = []
+        self.old_log_prob_list = []
 
     def add(self,obs, V_targ, old_log_prob):
-        self.buff.append([obs, V_targ, old_log_prob])
+        self.obs_list.append(obs)
+        self.V_targ_list.append(V_targ)
+        self.old_log_prob_list.append(old_log_prob)
 
     def data(self):
-        obs = torch.FloatTensor([exp[0] for exp in self.buff]).to(device)
-        V_targ = torch.FloatTensor([exp[1] for exp in self.buff]).to(device)
-        old_log_prob = torch.FloatTensor([exp[2] for exp in self.buff]).to(device)
-        return obs, V_targ,old_log_prob
+        return self.obs_list, self.V_targ_list, self.old_log_prob_list
     
     def clean(self):
-        self.buff.clear()
-        
+        self.obs_list = []
+        self.V_targ_list = []
+        self.old_log_prob_list = []
+
     def __len__(self):
         return len(self.buff)
 
 
         
-
+        
 # %%
 loss_act_list, loss_v_list, loss_ent_list, reward_list = [], [], [], []
 agent = PPG(n_state, n_action)
-loss_act, loss_v = 0, 0
+loss_act, loss_v, aux_act,aux_v = 0, 0, 0, 0
 n_step = 0
 for i in tqdm(range(3000)):
     data = run_episode(env, agent)
     agent.old_v_net.load_state_dict(agent.v_net.state_dict())
-    agent.old_act_net.load_state_dict(agent.act_net.state_dict())
-    for _ in range(2):
-        loss_act, loss_v, loss_ent = agent.update(data)
+    agent.old_policy_net.load_state_dict(agent.policy_net.state_dict())
+    
+    loss_act, loss_v, loss_ent = agent.update(data)
+    aux_act,aux_v = agent.update_aux(data)
+
     rew = sum(data[2])
     if i > 0 and i % 50 == 0:
         run_episode(env, agent, True)[2]
@@ -259,5 +294,5 @@ df = pd.DataFrame({'loss_v': loss_v_list,
                    'loss_act': loss_act_list,
                    'loss_ent': loss_ent_list,
                    'reward': reward_list})
-df.to_csv("./ClassMaterials/Lecture_21_PPO/data/ppo.csv",
+df.to_csv("./ClassMaterials/Lecture_21_PPG/data/PPG.csv",
           index=False, header=True)

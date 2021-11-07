@@ -201,7 +201,7 @@ class PPG():
         adv = torch.FloatTensor(adv).to(device)
         returns = torch.FloatTensor(returns).to(device)
         # Calculate loss
-        batch_size = 1
+        batch_size = 32
         list = [j for j in range(len(obs))]
         for i in range(0, len(list), batch_size):
             index = list[i:i+batch_size]

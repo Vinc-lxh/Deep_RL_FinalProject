@@ -137,19 +137,18 @@ class PPG():
         
         next_obs = torch.FloatTensor(next_obs).to(device)
         act = torch.FloatTensor(act).to(device)
-        V_targ = torch.FloatTensor(V_targ[0]).to(device)
-        old_log_prob = torch.FloatTensor(old_log_prob[0]).to(device)
+        V_targ = torch.FloatTensor(V_targ).to(device)
+        old_log_prob = torch.FloatTensor(old_log_prob).to(device)
         for _ in range(self.E_aux):
             output,v_aux = self.policy_net(obs)  #extract theta and mu, v_aux from the network
             mu = self.act_lim*torch.tanh(output[:, :n_action])
             var = torch.abs(output[:, n_action:])
             dist = Normal(mu, var)
-            new_log_prob = dist.log_prob(act)  #???
         
             aux_loss =  F.mse_loss(v_aux, V_targ)
             new_log_prob = dist.log_prob(act).squeeze()
-            loss_kl = F.kl_div(new_log_prob,old_log_prob)
-            policy_loss = aux_loss + loss_kl
+            loss_kl = F.kl_div(new_log_prob,old_log_prob.squeeze())
+            policy_loss = aux_loss + self.beta_clone*loss_kl
             self.policy_optimizer.zero_grad()
             policy_loss.backward()
             self.policy_optimizer.step()
@@ -158,6 +157,8 @@ class PPG():
             self.v_optimizer.zero_grad()
             v_loss.backward()
             self.v_optimizer.step()
+        
+        self.buff.clean()
 
         return policy_loss.item(), v_loss.item()
 
@@ -224,7 +225,7 @@ class PPG():
                 act_loss.backward()
                 self.policy_optimizer.step()
 
-                self.buff.add(obs, returns, logprob) #State, V_targ, logprob, ask if that make sense?
+            self.buff.add(obs[index], returns[index], logprob.detach()) #State, V_targ, logprob, ask if that make sense?
 
             for _ in range(self.E_v):
                 v_loss = F.mse_loss(self.v_net(
@@ -249,7 +250,7 @@ class Buffer:
         self.old_log_prob_list.append(old_log_prob)
 
     def data(self):
-        return self.obs_list, self.V_targ_list, self.old_log_prob_list
+        return self.obs_list, torch.cat(self.V_targ_list), torch.cat(self.old_log_prob_list)
     
     def clean(self):
         self.obs_list = []

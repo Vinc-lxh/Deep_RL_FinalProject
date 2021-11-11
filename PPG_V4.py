@@ -3,7 +3,7 @@ import numpy as np
 import gym
 import torch
 from torch import nn
-from torch.distributions.normal import Normal
+from torch.distributions import Normal,kl
 import torch.nn.functional as F
 from torch.distributions.kl import kl_divergence
 from collections import deque
@@ -57,17 +57,18 @@ class Policy(nn.Module):
             nn.ReLU(),
             nn.Linear(256,256),
             nn.ReLU(),
+            nn.Linear(256, 2*n_action+1)
         )
 
-        self.theta_mu_head = nn.Linear(256, 2*n_action)
-        self.v_aux_head = nn.Linear(256, 1)
+    
+        #self.v_aux_head = nn.Linear(256, 1)
 
     def forward(self, state):
         out = self.fc(state)
-        theta_mu = self.theta_mu_head(out)
-        v_aux = self.v_aux_head(out)
+        # theta_mu = out[:n_action*2]
+        # v_aux = out[2*n_action:]
 
-        return theta_mu, v_aux
+        return out
 
 
 class Value(nn.Module):
@@ -90,12 +91,13 @@ class Value(nn.Module):
         return v_out
 
 
-def kl(mu1,var1,mu2,var2):
+def kld(mu1,var1,mu2,var2):
     distribution1   = Normal(mu1, var1)
     distribution2   = Normal(mu2, var2)
+    return kl.kl_divergence(distribution1, distribution2)
 
     # return np.log(var2/var1)+(var1**2+(mu1-mu2)**2)/(2*(var2**2))-1/2
-    return kl_divergence(distribution1, distribution2).float().to(device)
+    #return kl_divergence(distribution1, distribution2).float().to(device)
 
 class PPG():
     def __init__(self, n_state, n_action):
@@ -119,7 +121,7 @@ class PPG():
         self.gae_lambda = 0.85
         self._eps_clip = 0.2
         self.act_lim = 2
-        self.beta_clone = 1 #beta clone to control the entrogy bonus
+        self.beta_clone = 0.001 #beta clone to control the entrogy bonus
         self.E_Pi = 1  #number of iteration of Policy Epochs
         self.E_v = 1   #number of iteration of Value Epochs
         self.E_aux = 1 #numer of iteration of Auxiliary Phase
@@ -129,9 +131,9 @@ class PPG():
         with torch.no_grad():
             state = torch.FloatTensor(state).to(device)
             # calculate old logprob
-            output,_ = self.policy_net(state)
+            output = self.policy_net(state)
             mu = self.act_lim*torch.tanh(output[:n_action])
-            var = torch.abs(output[n_action:])
+            var = torch.abs(output[n_action:2*n_action])
             dist = Normal(mu, var)
             action = dist.sample()
             action = action.detach().cpu().numpy()
@@ -154,9 +156,10 @@ class PPG():
         for i in range(0, len(list), batch_size):
             index = list[i:i+batch_size]
             for _ in range(self.E_aux):
-                output,v_aux = self.policy_net(obs[index])  #extract theta and mu, v_aux from the network
-                mu = self.act_lim*torch.tanh(output[:, :n_action]).detach()
-                var = torch.abs(output[:, n_action:]).detach()
+                output = self.policy_net(obs[index])  #extract theta and mu, v_aux from the network
+                mu = self.act_lim*torch.tanh(output[:, :n_action])
+                var = torch.abs(output[:, n_action:2*n_action])
+                v_aux = output[:, 2*n_action:]
                 
                 # dist = Normal(mu, var)
                 # act = dist.sample()
@@ -172,7 +175,7 @@ class PPG():
                 aux_loss =  F.mse_loss(v_aux.squeeze(), V_targ[index])
                 #new_log_prob = dist.log_prob(act[index]).squeeze()
                 #loss_kl = F.kl_div(new_log_prob,old_log_prob[index],reduction='batchmean')
-                loss_kl = kl(mu,var,old_mu,old_theta).mean()
+                loss_kl = kld(mu,var,old_mu,old_theta).mean()
                 policy_loss = aux_loss + self.beta_clone*loss_kl
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
@@ -196,9 +199,9 @@ class PPG():
         with torch.no_grad():
             v_s = self.old_v_net(obs).detach().cpu().numpy().squeeze()
             v_s_ = self.old_v_net(next_obs).detach().cpu().numpy().squeeze()
-            output,_ = self.old_policy_net(obs)
+            output = self.old_policy_net(obs)
             mu = self.act_lim*torch.tanh(output[:, :n_action])
-            var = torch.abs(output[:, n_action:])
+            var = torch.abs(output[:, n_action:2*n_action])
             dist = Normal(mu, var)
             old_logprob = dist.log_prob(act)
 
@@ -232,9 +235,9 @@ class PPG():
         for i in range(0, len(list), batch_size):
             index = list[i:i+batch_size]
             for _ in range(self.E_Pi):
-                output,_ = self.policy_net(obs[index])  #?
+                output = self.policy_net(obs[index])  #?
                 mu = self.act_lim*torch.tanh(output[:, :n_action])
-                var = torch.abs(output[:, n_action:])
+                var = torch.abs(output[:, n_action:2*n_action])
                 dist = Normal(mu, var)
                 logprob = dist.log_prob(act[index])
 
@@ -245,7 +248,7 @@ class PPG():
                 act_loss = -torch.min(surr1, surr2).mean()
 
                 ent_loss = dist.entropy().mean()            #entroy loss
-                act_loss -= 0.01 * ent_loss      #L_clip - beta_clone * entropy_bonus
+                act_loss -= 0.1 * ent_loss      #L_clip - beta_clone * entropy_bonus
                 self.policy_optimizer.zero_grad()
                 act_loss.backward()
                 self.policy_optimizer.step()

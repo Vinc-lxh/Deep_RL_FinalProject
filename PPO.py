@@ -99,7 +99,7 @@ class PPO():
             v_s_ = self.old_v_net(next_obs).detach().cpu().numpy().squeeze()
             output = self.old_act_net(obs)
             mu = self.act_lim*torch.tanh(output[:, :n_action])
-            var = torch.abs(output[:, n_action:])
+            var = torch.abs(output[:, n_action:2*n_action])
             dist = Normal(mu, var)
             old_logprob = dist.log_prob(act)
 

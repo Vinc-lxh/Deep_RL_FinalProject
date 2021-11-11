@@ -155,7 +155,7 @@ class PPG():
                 mu = self.act_lim*torch.tanh(output[:, :n_action]).detach()
                 var = torch.abs(output[:, n_action:]).detach()
                 loss_kl = kl(mu,var,old_mu,old_theta).mean()
-                policy_loss = aux_loss + self.beta_clone*loss_kl
+                policy_loss = aux_loss #+ self.beta_clone*loss_kl
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
                 self.policy_optimizer.step()
@@ -301,6 +301,7 @@ for i in tqdm(range(3000)):
         agent.old_v_net.load_state_dict(agent.v_net.state_dict())
         agent.old_policy_net.load_state_dict(agent.policy_net.state_dict())
         loss_act, loss_v, loss_ent = agent.update(data)
+
 
     obs_list,V_targ,_,_ = agent.buff.data()
     mu_li = np.zeros_like(V_targ.cpu())
